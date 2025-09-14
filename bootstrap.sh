@@ -8,7 +8,7 @@
 pip install --upgrade pip
 
 pip install mujoco pygame \
-    mujoco-mjx brax flax \
+    mujoco-mjx brax flax orbax-checkpoint\
     hydra-core einops \
     matplotlib imageio-ffmpeg \
     wandb ipython ipykernel tqdm rich nbformat mediapy 

@@ -151,18 +151,18 @@ class DoubinteDataset(Dataset):
     def __getitem__(self, idx):
         i, t = self.window_start_inds[idx]
         
-        from_ = self.data.xs[i, t:t+1]  # (1, nx)
+        from_ = self.data.xs[i, t:t+1].squeeze(0)  # (1, nx) -> (nx,)
         ctrl_ = self.data.us[i, t:t+self.cfg.pred_horizon]  # (pred_horizon, nu)
         to_ = self.data.xs[i, t+1:t+self.cfg.pred_horizon+1]  # (pred_horizon, nx)
         
         return {'from': from_, 'ctrl': ctrl_, 'to': to_}
 
-        
+
     @staticmethod
     def collate_fn(batch):
         batch = tree_map(np.asarray, batch)
         return {
-            'from': jnp.stack([b['from'] for b in batch]), # (b, 1, nx)
+            'from': jnp.stack([b['from'] for b in batch]), # (b, nx)
             'ctrl': jnp.stack([b['ctrl'] for b in batch]), # (b, pred_horizon, nu)
             'to': jnp.stack([b['to'] for b in batch]),     # (b, pred_horizon, nx)
         }
