@@ -1,0 +1,24 @@
+<mujoco>
+  <compiler inertiafromgeom="false" coordinate="local"/>
+
+  <worldbody>
+    <light name="top" pos="0 0 1"/>
+    
+    <body name="cart_x" pos="0 0 0">
+      <inertial pos="0 0 0" mass="1e-6" diaginertia="1e-6 1e-6 1e-6" />
+      <joint name="slider_x" type="slide" axis="1 0 0" limited="false"/>
+      
+      <body name="cart_y" pos="0 0 0">
+        <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01" />
+        <joint name="slider_y" type="slide" axis="0 1 0" limited="false"/>
+        
+        <geom name="sphere_geom" type="sphere" size=".2" rgba="1 0 0 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="force_x" joint="slider_x" gear="1" ctrllimited="false"/>
+    <motor name="force_y" joint="slider_y" gear="1" ctrllimited="false"/>
+  </actuator>
+</mujoco>
