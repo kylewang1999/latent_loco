@@ -281,7 +281,7 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     batch = next(iter(dataloader))
     x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
     B, _pred_horizon, nu = us.shape
-    pred_horizon = _pred_horizon if cfg_train.max_eval_pred_horizon is None else min(cfg_train.max_eval_pred_horizon, _pred_horizon)
+    pred_horizon = cfg_train.max_eval_pred_horizon
     
     z = rom.encode(x)
     x_recon = rom.decode(z)
@@ -316,7 +316,9 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     
     for (ax, data) in zip(axes, [zs_next, zs_next_pred, xs_next, xs_next_pred]):
         for i in range(data.shape[0]):
-            ax.scatter(data[i,-1,0], data[i,-1,1])
+            ax.plot(data[i,:,0], data[i,:,1])
+            ax.plot(data[i,0,0], data[i,0,1], 'r.')
+            ax.plot(data[i,-1,0], data[i,-1,1], 'g*')
     plt.show()
     
     
