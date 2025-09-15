@@ -1,13 +1,8 @@
-import jax
+import jax, jax.numpy as jnp
 from flax.struct import dataclass as flax_dataclass
 import flax.nnx as nnx
-import jax.numpy as jnp
 from typing import Callable
-from jax import vmap
-from dataclasses import fields
-from einops import rearrange
-from jax.lax import stop_gradient
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Dict
 import optax
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -69,9 +64,10 @@ class BaseROM():
         diff = jnp.linalg.norm(z_reproj - z, axis=-1)
         return jnp.mean(diff)
     
-    def loss_fwd(self, batch:dict) -> jnp.ndarray:
+    def loss_fwd(self, batch:dict, pred_horizon: int|None = None) -> jnp.ndarray:
         x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
-        B, pred_horizon, _ = us.shape
+        B, _pred_horizon, nu = us.shape
+        pred_horizon = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
         
         z = self.encode(x)
         zs_next_pred = jnp.zeros((B, pred_horizon, self.cfg.nz))
@@ -87,9 +83,10 @@ class BaseROM():
         diff = jnp.linalg.norm(zs_next_pred - zs_next, axis=-1)
         return jnp.mean(diff)
     
-    def loss_bwd(self, batch:dict) -> jnp.ndarray: 
+    def loss_bwd(self, batch:dict, pred_horizon: int|None = None) -> jnp.ndarray: 
         x, xs_next, us = batch['from'], batch['to'], batch['ctrl']
-        B, pred_horizon, _ = us.shape
+        B, _pred_horizon, nu = us.shape
+        pred_horizon = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
         
         z = self.encode(x)
         xs_next_pred = jnp.zeros((B, pred_horizon, self.cfg.nx))
@@ -146,10 +143,10 @@ class NNDoubinteROM(BaseROM, nnx.Module):
     def fz(self, z: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:  # natively batched, but vmap also supported
         return self.nn_fz(jnp.hstack([z, u])) + z
 
-    def loss_recon(self, batch:dict) -> jnp.ndarray: return super().loss_recon(batch)
-    def loss_reproj(self, batch:dict) -> jnp.ndarray: return super().loss_reproj(batch)
-    def loss_fwd(self, batch:dict) -> jnp.ndarray: return super().loss_fwd(batch)
-    def loss_bwd(self, batch:dict) -> jnp.ndarray: return super().loss_bwd(batch)
+    def loss_recon(self, *args, **kwargs) -> jnp.ndarray: return super().loss_recon(*args, **kwargs)
+    def loss_reproj(self, *args, **kwargs) -> jnp.ndarray: return super().loss_reproj(*args, **kwargs)
+    def loss_fwd(self, *args, **kwargs) -> jnp.ndarray: return super().loss_fwd(*args, **kwargs)
+    def loss_bwd(self, *args, **kwargs) -> jnp.ndarray: return super().loss_bwd(*args, **kwargs)
 
 
 class LossState(nnx.TrainState):
@@ -190,8 +187,11 @@ class CfgLoss:
 class CfgTrain:
     lr: float = 5e-2
     batch_size: int = 4096
+    batch_size_eval: int = 256
     num_epochs: int = 10
     num_logs: int = 10
+    max_train_pred_horizon: int = 4
+    max_eval_pred_horizon: int = 4
     enable_lr_schedule: bool = False
     enable_grad_clipping: bool = True
     grad_clipping_value: float = 5.0
@@ -226,17 +226,17 @@ def train(rom: nnx.Module, dataset: Dataset,
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     
     @nnx.jit
-    def step(model: nnx.Module, batch: dict, weights: CfgLoss):
+    def step(model: nnx.Module, batch: dict, cfg_loss: CfgLoss):
         
         def loss_fn(m: BaseROM):
             recon = m.loss_recon(batch)
             reproj = m.loss_reproj(batch)
-            fwd   = m.loss_fwd(batch)
-            bwd   = m.loss_bwd(batch)
-            total = (weights.recon * recon
-                     + weights.reproj * reproj
-                     + weights.fwd   * fwd
-                     + weights.bwd   * bwd)
+            fwd   = m.loss_fwd(batch, cfg_train.max_train_pred_horizon)
+            bwd   = m.loss_bwd(batch, cfg_train.max_train_pred_horizon)
+            total = (cfg_loss.recon * recon
+                     + cfg_loss.reproj * reproj
+                     + cfg_loss.fwd * fwd
+                     + cfg_loss.bwd * bwd)
             aux = {'recon': recon, 'reproj': reproj, 'fwd': fwd, 'bwd': bwd, 'total': total}
             return total, aux
 
@@ -255,7 +255,7 @@ def train(rom: nnx.Module, dataset: Dataset,
 
             batch_losses.append(loss)
             global_step += 1
-            pbar.set_postfix({"loss_b": f"{float(loss):.2e}", "epoch_progress": f"{i}/{len(dataloader)}"})
+            pbar.set_postfix({"b_loss": f"{float(loss):.2e}", "b_progress": f"{i}/{len(dataloader)}"})
 
     
         epoch_loss = jnp.mean(jnp.stack(batch_losses))
@@ -264,8 +264,62 @@ def train(rom: nnx.Module, dataset: Dataset,
                     else jnp.asarray(cfg_train.lr))
         pbar.set_description(f"Loss: {float(epoch_loss):.2e}, LR: {float(lr_val):.2e}")
 
+    fig, ax = plt.subplots(1, 1, figsize=(10, 3))
+    ax.plot(jnp.arange(len(epoch_losses)), epoch_losses)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training Loss')
+    plt.show()
+    
     return rom
 
+
+def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: CfgLoss):
+    
+    dataloader = DataLoader(dataset, batch_size=cfg_train.batch_size_eval, shuffle=False, collate_fn=dataset.collate_fn)
+
+    batch = next(iter(dataloader))
+    x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
+    B, _pred_horizon, nu = us.shape
+    pred_horizon = _pred_horizon if cfg_train.max_eval_pred_horizon is None else min(cfg_train.max_eval_pred_horizon, _pred_horizon)
+    
+    z = rom.encode(x)
+    x_recon = rom.decode(z)
+    z_reproj = rom.encode(x_recon)
+    zs_next_pred = jnp.zeros((B, pred_horizon, rom.cfg.nz))
+    xs_next_pred = jnp.zeros((B, pred_horizon, rom.cfg.nx))
+    
+    def step(t, carry):
+        z, zs_next_pred, xs_next_pred = carry
+        z = rom.fz(z, us[:,t])
+        x_dec = rom.decode(z)
+        zs_next_pred = zs_next_pred.at[:,t].set(z)
+        xs_next_pred = xs_next_pred.at[:, t].set(x_dec)
+        return z, zs_next_pred, xs_next_pred
+    
+    _, zs_next_pred, xs_next_pred = jax.lax.fori_loop(0, pred_horizon, step, (z, zs_next_pred, xs_next_pred))   
+    zs_next = rom.encode(xs_next)
+
+    fig1, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].set_title(r"Initial States $x_0$")
+    axes[1].set_title(r"Reconstructed States $D(E(x_0))$")
+    axes[2].set_title(r"Reprojected States $E(D(E(x_0)))$")
+    for (ax, data) in zip(axes, [x, x_recon, z_reproj]):
+        ax.scatter(data[:,0], data[:,1])
+    plt.show()
+    
+    fig2, axes = plt.subplots(1, 4, figsize=(20, 5))
+    axes[0].set_title(r"Rollout $E(x_{\tau+1})$, $\tau=$" + str(pred_horizon))
+    axes[1].set_title(r"Rollout Pred $E(x_t) + f_z^{(\tau)}\circ E(x_t)$")
+    axes[2].set_title(r"Rollout $x_{\tau+1}$, $\tau=$" + str(pred_horizon))
+    axes[3].set_title(r"Rollout Pred $x_t + D(f_z^{(\tau)}\circ E(x_t))$")
+    
+    for (ax, data) in zip(axes, [zs_next, zs_next_pred, xs_next, xs_next_pred]):
+        for i in range(data.shape[0]):
+            ax.scatter(data[i,-1,0], data[i,-1,1])
+    plt.show()
+    
+    
 
 def post_train(rom: nnx.Module, dataset: Dataset, 
                cfg_train: CfgTrain, cfg_loss: CfgLoss, save_dir: str):

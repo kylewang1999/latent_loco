@@ -200,9 +200,12 @@ def save_nnx_module(model: nnx.Module, save_dir: str):
     nnx.display(state)
     
     ckpt_dir = ocp.test_utils.erase_and_create_empty(save_dir)
-    checkpointer = ocp.StandardCheckpointer()
-    checkpointer.save(save_dir / "state", state)
+    checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+    checkpointer.save(save_dir / "state", args=ocp.args.StandardSave(state))
+    checkpointer.wait_until_finished()
     CONSOLE_LOGGER.info(f"NNX module saved to {save_dir}")
+    
+    
 
 
 def restore_nnx_module(build_fn: Callable[[], nnx.Module],
