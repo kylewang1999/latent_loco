@@ -11,7 +11,9 @@ from wandb.sdk.wandb_run import Run
 from pathlib import Path
 import mujoco
 from brax.io import mjcf
-import jax.numpy as jnp
+
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+import jax, jax.numpy as jnp
 from functools import wraps
 import flax.nnx as nnx
 import orbax.checkpoint as ocp
@@ -153,7 +155,6 @@ def catch_keyboard_interrupt(message: str = "Training interrupted by user"):
     return decorator
 
 
-
 def display_video(imgs_array, save=False, save_path='./video.mp4'):
     
     imgs_array = imgs_array.astype(np.uint8)
@@ -204,8 +205,6 @@ def save_nnx_module(model: nnx.Module, save_dir: str):
     checkpointer.save(save_dir / "state", args=ocp.args.StandardSave(state))
     checkpointer.wait_until_finished()
     CONSOLE_LOGGER.info(f"NNX module saved to {save_dir}")
-    
-    
 
 
 def restore_nnx_module(build_fn: Callable[[], nnx.Module],
