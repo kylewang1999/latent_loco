@@ -122,7 +122,40 @@ class CfgDataLoad:
     pred_horizon: int = 4
 
 
-class DoubinteDataset(Dataset):
+
+class BaseDataset(Dataset):
+    def __init__(self, cfg: CfgDataLoad, data_path:str):
+        self.cfg = cfg
+        self.data_path = data_path
+        self.data: IntegratorOutput|None = None
+        self.max_tstep: int|None = None
+        self.window_start_inds: list[tuple[int, int]]|None = None
+        
+    
+    def __len__(self): return len(self.window_start_inds)
+    
+    
+    def __getitem__(self, idx):
+        i, t = self.window_start_inds[idx]
+        
+        from_ = self.data.xs[i, t:t+1].squeeze(0)  # (1, nx) -> (nx,)
+        ctrl_ = self.data.us[i, t:t+self.cfg.pred_horizon]  # (pred_horizon, nu)
+        to_ = self.data.xs[i, t+1:t+self.cfg.pred_horizon+1]  # (pred_horizon, nx)
+        
+        return {'from': from_, 'ctrl': ctrl_, 'to': to_}
+
+
+    @staticmethod
+    def collate_fn(batch):
+        batch = tree_map(np.asarray, batch)
+        return {
+            'from': jnp.stack([b['from'] for b in batch]), # (b, nx)
+            'ctrl': jnp.stack([b['ctrl'] for b in batch]), # (b, pred_horizon, nu)
+            'to': jnp.stack([b['to'] for b in batch]),     # (b, pred_horizon, nx)
+        }
+
+
+class DoubinteDataset(BaseDataset):
     
     def __init__(self, cfg: CfgDataLoad, data_path:str=osp.join(get_repo_root(), "data/doubinte_data_5e4.npz")):
         
@@ -145,27 +178,24 @@ class DoubinteDataset(Dataset):
                                          for t in range(self.max_tstep - self.cfg.pred_horizon - 1)]
         
 
-    def __len__(self): return len(self.window_start_inds)
-    
-    
-    def __getitem__(self, idx):
-        i, t = self.window_start_inds[idx]
-        
-        from_ = self.data.xs[i, t:t+1].squeeze(0)  # (1, nx) -> (nx,)
-        ctrl_ = self.data.us[i, t:t+self.cfg.pred_horizon]  # (pred_horizon, nu)
-        to_ = self.data.xs[i, t+1:t+self.cfg.pred_horizon+1]  # (pred_horizon, nx)
-        
-        return {'from': from_, 'ctrl': ctrl_, 'to': to_}
 
+class CartPoleDataset(BaseDataset):
+    
+    def __init__(self, cfg: CfgDataLoad, data_path:str=osp.join(get_repo_root(), "data/cart_pole_data.npz")):
+        self.cfg = cfg
+        self.data_path = data_path
+        
+        data_np = np.load(data_path)
+        
+        self.data:IntegratorOutput = IntegratorOutput(xs=np.concatenate([data_np['q_traj'], data_np['v_traj']], axis=-1), 
+                                                      us=data_np['u_traj'])
+        
+        self.max_tstep = self.data.us.shape[1]
+        
+        self.window_start_inds = [(i, t) for i in range(self.data.us.shape[0]) 
+                                         for t in range(self.max_tstep - self.cfg.pred_horizon - 1)]
+        
 
-    @staticmethod
-    def collate_fn(batch):
-        batch = tree_map(np.asarray, batch)
-        return {
-            'from': jnp.stack([b['from'] for b in batch]), # (b, nx)
-            'ctrl': jnp.stack([b['ctrl'] for b in batch]), # (b, pred_horizon, nu)
-            'to': jnp.stack([b['to'] for b in batch]),     # (b, pred_horizon, nx)
-        }
 
 
 
