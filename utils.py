@@ -196,6 +196,9 @@ def wandb_log_artifact(run:Run, type, path):
 
 def save_nnx_module(model: nnx.Module, save_dir: str):
     
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        
     save_dir = ocp.test_utils.erase_and_create_empty(save_dir)
     _, state, _ = nnx.split(model, nnx.Not(nnx.RngState), nnx.RngState)
     nnx.display(state)

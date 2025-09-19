@@ -116,16 +116,21 @@ def load_rollout(path:str) -> IntegratorOutput:
     return IntegratorOutput(xs=data['xs'], us=data['us'])
 
 
-@dataclass
-class CfgDataLoad:
-    batch_size: int = 128
-    pred_horizon: int = 4
-
-
 
 class BaseDataset(Dataset):
-    def __init__(self, cfg: CfgDataLoad, data_path:str):
-        self.cfg = cfg
+    
+    def __init__(self, pred_horizon: int, data_path:str):
+                
+        ''' Datset for multistep dynamics prediction learning 
+        Converts [xs (B, T+1, nx), us (B, T, nu)] to batches of the form:
+        {
+            'from': init states (b, 1, nx),
+            'ctrl': controls (b, pred_horizon, nu),
+            'to':   goal states (b, pred_horizon, nx),
+        }
+        '''
+        
+        self.pred_horizon = pred_horizon
         self.data_path = data_path
         self.data: IntegratorOutput|None = None
         self.max_tstep: int|None = None
@@ -139,50 +144,52 @@ class BaseDataset(Dataset):
         i, t = self.window_start_inds[idx]
         
         from_ = self.data.xs[i, t:t+1].squeeze(0)  # (1, nx) -> (nx,)
-        ctrl_ = self.data.us[i, t:t+self.cfg.pred_horizon]  # (pred_horizon, nu)
-        to_ = self.data.xs[i, t+1:t+self.cfg.pred_horizon+1]  # (pred_horizon, nx)
+        ctrl_ = self.data.us[i, t:t+self.pred_horizon]  # (pred_horizon, nu)
+        to_ = self.data.xs[i, t+1:t+self.pred_horizon+1]  # (pred_horizon, nx)
         
         return {'from': from_, 'ctrl': ctrl_, 'to': to_}
+    
+    
+    def _log(self):
+        CONSOLE_LOGGER.info(f"DoubinteDataset initialized with {len(self.window_start_inds)} windows/items")
+        CONSOLE_LOGGER.info(f"\t pred_horizon: {self.pred_horizon}, max_tstep: {self.max_tstep}")
+        CONSOLE_LOGGER.info(f"\t xs_raw_shape: {self.data.xs.shape}, us_raw_shape: {self.data.us.shape}")
+        
 
 
     @staticmethod
     def collate_fn(batch):
-        batch = tree_map(np.asarray, batch)
-        return {
-            'from': jnp.stack([b['from'] for b in batch]), # (b, nx)
-            'ctrl': jnp.stack([b['ctrl'] for b in batch]), # (b, pred_horizon, nu)
-            'to': jnp.stack([b['to'] for b in batch]),     # (b, pred_horizon, nx)
-        }
+        batch = tree_map(jnp.asarray, batch)
+        return batch
 
 
 class DoubinteDataset(BaseDataset):
     
-    def __init__(self, cfg: CfgDataLoad, data_path:str=osp.join(get_repo_root(), "data/doubinte_data_5e4.npz")):
+    def __init__(self, pred_horizon: int, data_path:str=osp.join(get_repo_root(), "data/doubinte_data_5e4.npz")):
         
-        ''' Datset for multistep dynamics prediction learning 
-        Converts [xs (B, T+1, nx), us (B, T, nu)] to batches of the form:
-        {
-            'from': init states (b, 1, nx),
-            'ctrl': controls (b, pred_horizon, nu),
-            'to':   goal states (b, pred_horizon, nx),
-        }
-        '''
+        super().__init__(pred_horizon, data_path)
         
-        self.cfg = cfg
+        self.pred_horizon = pred_horizon
         self.data_path = data_path
         self.data: IntegratorOutput = load_rollout(data_path)
         
         self.max_tstep = self.data.us.shape[1]
         
         self.window_start_inds = [(i, t) for i in range(self.data.us.shape[0]) 
-                                         for t in range(self.max_tstep - self.cfg.pred_horizon - 1)]
+                                         for t in range(self.max_tstep - self.pred_horizon - 1)]
         
+        super()._log()
+        
+
 
 
 class CartPoleDataset(BaseDataset):
     
-    def __init__(self, cfg: CfgDataLoad, data_path:str=osp.join(get_repo_root(), "data/cart_pole_data.npz")):
-        self.cfg = cfg
+    def __init__(self, pred_horizon: int, data_path:str=osp.join(get_repo_root(), "data/cart_pole_data.npz")):
+        
+        super().__init__(pred_horizon, data_path)
+        
+        self.pred_horizon = pred_horizon
         self.data_path = data_path
         
         data_np = np.load(data_path)
@@ -193,9 +200,9 @@ class CartPoleDataset(BaseDataset):
         self.max_tstep = self.data.us.shape[1]
         
         self.window_start_inds = [(i, t) for i in range(self.data.us.shape[0]) 
-                                         for t in range(self.max_tstep - self.cfg.pred_horizon - 1)]
+                                         for t in range(self.max_tstep - self.pred_horizon - 1)]
         
-
+        super()._log()
 
 
 

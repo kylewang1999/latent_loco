@@ -6,7 +6,9 @@ from typing import Tuple, Dict
 import optax
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
+import jax_dataloader as jdl
+import wandb
 
 from utils import catch_keyboard_interrupt, save_nnx_module
 
@@ -16,6 +18,27 @@ class CfgROMBase:
     nx: int|None = None
     nz: int|None = None
     nu: int|None = None
+
+@flax_dataclass
+class CfgNNDoubinteROM(CfgROMBase):
+    nx: int = 2
+    nz: int = 2
+    nu: int = 1
+    encoder_specs: Tuple[int, ...]|None = (16,16)
+    decoder_specs: Tuple[int, ...]|None = (16,16)
+    fz_specs: Tuple[int, ...] = (16,)
+    act: Callable = nnx.tanh
+    
+@flax_dataclass
+class CfgNNCartPoleROM(CfgROMBase):
+    nx: int = 4
+    nz: int = 4
+    nu: int = 1
+    encoder_specs: Tuple[int, ...]|None = (16,16)
+    decoder_specs: Tuple[int, ...]|None = (16,16)
+    fz_specs: Tuple[int, ...] = (32,32,32)
+    act: Callable = nnx.tanh
+    
 
 
 class MLP(nnx.Module):
@@ -67,56 +90,46 @@ class BaseROM():
     def loss_fwd(self, batch:dict, pred_horizon: int|None = None) -> jnp.ndarray:
         x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
         B, _pred_horizon, nu = us.shape
-        pred_horizon = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
-        
-        z = self.encode(x)
-        zs_next_pred = jnp.zeros((B, pred_horizon, self.cfg.nz))
-        
-        def step(t, carry):
-            z, zs_next_pred = carry
-            z = self.fz(z, us[:,t])
-            zs_next_pred = zs_next_pred.at[:,t].set(z)
-            return z, zs_next_pred
-        
-        _, zs_next_pred = jax.lax.fori_loop(0, pred_horizon, step, (z, zs_next_pred))   
-        zs_next = self.encode(xs_next)
-        diff = jnp.linalg.norm(zs_next_pred - zs_next, axis=-1)
-        return jnp.mean(diff)
+        T = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
+            
+        z0 = self.encode(x)  # (B, nz)
+
+        def step(carry, inputs):
+            z, ut = carry, inputs
+            z_next = self.fz(z, ut)   # (B, nz)
+            return z_next, z_next     # carry zt, collect z_t
+
+        us_TBN = jnp.swapaxes(us[:, :T], 0, 1)      # (T, B, nu)
+        _, zs_pred_TBN = jax.lax.scan(step, z0, us_TBN)  # (T, B, nz)
+        zs_pred = jnp.swapaxes(zs_pred_TBN, 0, 1)        # (B, T, nz)
+        zs_true = self.encode(xs_next[:, :T])            # (B, T, nz)
+        diff = jnp.linalg.norm(zs_pred - zs_true, axis=-1)  # (B, T)
+        return diff.mean()
     
     def loss_bwd(self, batch:dict, pred_horizon: int|None = None) -> jnp.ndarray: 
         x, xs_next, us = batch['from'], batch['to'], batch['ctrl']
         B, _pred_horizon, nu = us.shape
-        pred_horizon = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
+        T = _pred_horizon if pred_horizon is None else min(pred_horizon, _pred_horizon)
         
-        z = self.encode(x)
-        xs_next_pred = jnp.zeros((B, pred_horizon, self.cfg.nx))
-        
-        def step(t, carry):
-            z, xs_pred = carry
-            z = self.fz(z, us[:,t])
-            x_dec = self.decode(z)
-            xs_pred = xs_pred.at[:, t].set(x_dec)
-            return (z, xs_pred)
+        z0 = self.encode(x)  # (B, nz)
 
-        _, xs_next_pred = jax.lax.fori_loop(0, pred_horizon, step, (z, xs_next_pred))
-        diff = jnp.linalg.norm(xs_next_pred - xs_next, axis=-1)  # (B,T)
-        return jnp.mean(diff)
+        def step(carry, inputs):
+            z, ut = carry, inputs
+            z_next = self.fz(z, ut)   # (B, nz)
+            return z_next, z_next     # carry zt, collect z_t
+
+        us_TBN = jnp.swapaxes(us[:, :T], 0, 1)           # (T, B, nu)
+        _, zs_pred_TBN = jax.lax.scan(step, z0, us_TBN)  # (T, B, nz)
+        zs_pred = jnp.swapaxes(zs_pred_TBN, 0, 1)        # (B, T, nz)
+        xs_next_pred = self.decode(zs_pred)              # (B, T, nx)
+
+        diff = jnp.linalg.norm(xs_next_pred - xs_next[:, :T], axis=-1)  # (B, T)
+        return diff.mean()
 
  
-@flax_dataclass
-class CfgNNDoubinteROM(CfgROMBase):
-    nx: int = 2
-    nz: int = 2
-    nu: int = 1
-    encoder_specs: Tuple[int, ...]|None = None
-    decoder_specs: Tuple[int, ...]|None = None
-    fz_specs: Tuple[int, ...] = (16,)
-    act: Callable = nnx.tanh
+class NNROM(BaseROM, nnx.Module):
     
-
-class NNDoubinteROM(BaseROM, nnx.Module):
-    
-    def __init__(self, cfg: CfgNNDoubinteROM, *, rngs: nnx.Rngs = nnx.Rngs(0)):
+    def __init__(self, cfg: CfgROMBase, *, rngs: nnx.Rngs = nnx.Rngs(0)):
         
         BaseROM.__init__(self, cfg)
         nnx.Module.__init__(self)
@@ -129,8 +142,7 @@ class NNDoubinteROM(BaseROM, nnx.Module):
 
         self.nn_decoder = Identity() if self.cfg.decoder_specs is None else\
                           MLP(nz, nx, self.cfg.decoder_specs, act=self.cfg.act, rngs=self.rngs)
-            
-        print(nz, nu, nz+nu)
+
         self.nn_fz = MLP(nz+nu, nz, self.cfg.fz_specs, act=self.cfg.act, rngs=self.rngs)
 
         
@@ -185,7 +197,7 @@ class CfgLoss:
 
 @flax_dataclass
 class CfgTrain:
-    lr: float = 5e-2
+    lr: float = 1e-2
     batch_size: int = 4096
     batch_size_eval: int = 256
     num_epochs: int = 10
@@ -196,13 +208,22 @@ class CfgTrain:
     enable_grad_clipping: bool = True
     grad_clipping_value: float = 5.0
     train_portion: float = 0.9
+    # wandb config
+    use_wandb: bool = False
+    wandb_project: str = "latent_loco"
+    wandb_run_name: str|None = None
+    wandb_log_frequency: int = 1  # log every N batches
+    
 
 
 @catch_keyboard_interrupt("Training interrupted by user")
 def train(rom: nnx.Module, dataset: Dataset,
           cfg_train: CfgTrain, cfg_loss: CfgLoss):
+
+    dataloader = jdl.DataLoader(dataset, batch_size=cfg_train.batch_size, 
+                                backend='pytorch', shuffle=True, 
+                                num_workers=8, pin_memory=True, persistent_workers=True)
     
-    dataloader = DataLoader(dataset, batch_size=cfg_train.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
     total_steps = cfg_train.num_epochs * len(dataloader)
     if cfg_train.enable_lr_schedule:
         lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -226,7 +247,7 @@ def train(rom: nnx.Module, dataset: Dataset,
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     
     @nnx.jit
-    def step(model: nnx.Module, batch: dict, cfg_loss: CfgLoss):
+    def step(model: nnx.Module, opt: nnx.Optimizer, batch: dict):
         
         def loss_fn(m: BaseROM):
             recon = m.loss_recon(batch)
@@ -241,7 +262,9 @@ def train(rom: nnx.Module, dataset: Dataset,
             return total, aux
 
         (loss_val, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
-        return loss_val, aux, grads
+        opt.update(grads=grads)
+        
+        return model, opt, loss_val, aux
 
 
     global_step = 0
@@ -250,19 +273,28 @@ def train(rom: nnx.Module, dataset: Dataset,
         
         batch_losses = []
         for i, batch in enumerate(dataloader):
-            loss, aux, grads = step(rom, batch, cfg_loss)
-            opt.update(grads=grads)
+            batch = dataset.collate_fn(batch)
+            rom, opt, loss, aux = step(rom, opt, batch)
 
             batch_losses.append(loss)
             global_step += 1
+            
             pbar.set_postfix({"b_loss": f"{float(loss):.2e}", "b_progress": f"{i}/{len(dataloader)}"})
-
+        
+        # log epoch-level metrics
     
         epoch_loss = jnp.mean(jnp.stack(batch_losses))
         epoch_losses.append(epoch_loss)
         lr_val = (lr_schedule(global_step) if cfg_train.enable_lr_schedule
                     else jnp.asarray(cfg_train.lr))
         pbar.set_description(f"Loss: {float(epoch_loss):.2e}, LR: {float(lr_val):.2e}")
+        
+        # Log epoch-level metrics to wandb
+        if cfg_train.use_wandb:
+            wandb.log({
+                "train/epoch_loss": float(epoch_loss),
+                "train/epoch": epoch
+            }, step=global_step)
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 3))
     ax.plot(jnp.arange(len(epoch_losses)), epoch_losses)
@@ -271,15 +303,22 @@ def train(rom: nnx.Module, dataset: Dataset,
     ax.set_title('Training Loss')
     plt.show()
     
+    # Finish wandb run
+    if cfg_train.use_wandb:
+        wandb.finish()
+    
     return rom
 
 
 def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: CfgLoss):
     
-    dataloader = DataLoader(dataset, batch_size=cfg_train.batch_size_eval, shuffle=False, collate_fn=dataset.collate_fn)
+    dataloader = jdl.DataLoader(dataset, batch_size=cfg_train.batch_size_eval, 
+                                backend='pytorch', shuffle=False)
 
     batch = next(iter(dataloader))
+    batch = dataset.collate_fn(batch)
     x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
+    
     B, _pred_horizon, nu = us.shape
     pred_horizon = cfg_train.max_eval_pred_horizon
     
@@ -309,9 +348,9 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     plt.show()
     
     fig2, axes = plt.subplots(1, 4, figsize=(20, 5))
-    axes[0].set_title(r"Rollout $E(x_{\tau+1})$, $\tau=$" + str(pred_horizon))
+    axes[0].set_title(r"Rollout $E(x_{t:t+\tau})$, $\tau=$" + str(pred_horizon))
     axes[1].set_title(r"Rollout Pred $E(x_t) + f_z^{(\tau)}\circ E(x_t)$")
-    axes[2].set_title(r"Rollout $x_{\tau+1}$, $\tau=$" + str(pred_horizon))
+    axes[2].set_title(r"Rollout $x_{t:t+\tau+1}$, $\tau=$" + str(pred_horizon))
     axes[3].set_title(r"Rollout Pred $x_t + D(f_z^{(\tau)}\circ E(x_t))$")
     
     for (ax, data) in zip(axes, [zs_next, zs_next_pred, xs_next, xs_next_pred]):
