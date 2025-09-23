@@ -27,7 +27,12 @@ class CfgNNDoubinteROM(CfgROMBase):
     encoder_specs: Tuple[int, ...]|None = (16,16)
     decoder_specs: Tuple[int, ...]|None = (16,16)
     fz_specs: Tuple[int, ...] = (16,)
-    act: Callable = nnx.tanh
+    act_fz: Callable = nnx.tanh
+    act_encoder: Callable = nnx.tanh
+    act_decoder: Callable = nnx.tanh
+    use_residual_encoder: bool =True
+    use_residual_decoder: bool =True
+    use_residual_fz: bool = True
     
 @flax_dataclass
 class CfgNNCartPoleROM(CfgROMBase):
@@ -37,27 +42,66 @@ class CfgNNCartPoleROM(CfgROMBase):
     encoder_specs: Tuple[int, ...]|None = (16,16)
     decoder_specs: Tuple[int, ...]|None = (16,16)
     fz_specs: Tuple[int, ...] = (32,32,32)
-    act: Callable = nnx.tanh
-    
+    act_fz: Callable = nnx.tanh
+    act_encoder: Callable = nnx.tanh
+    act_decoder: Callable = nnx.tanh
+    use_residual_encoder: bool = True
+    use_residual_decoder: bool = True
+    use_residual_fz: bool = True
 
 
 class MLP(nnx.Module):
     
     def __init__(self, din: int, dout: int, hidden_specs: Tuple[int, ...], 
-                 act: Callable = nnx.tanh, *, rngs: nnx.Rngs):
+                 act: Callable = nnx.tanh, use_residual: bool = True, *, rngs: nnx.Rngs):
         
-        layers = []
-        dprev = din
-        for w in hidden_specs:
-            layers.append(nnx.Linear(dprev, w, use_bias=True, rngs=rngs))
-            layers.append(act)
-            dprev = w
-        layers.append(nnx.Linear(dprev, dout, use_bias=True, rngs=rngs))
+        self.din = din
+        self.dout = dout
+        self.hidden_specs = hidden_specs
+        self.act = act
+        self.use_residual = use_residual
         
-        self.net = nnx.Sequential(*layers)
+        # Build the main network layers
+        self.layers = []
+        self.projections = []  # For dimension matching in residual connections
+        
+        all_dims = [din] + list(hidden_specs) + [dout]
+        
+        for i in range(len(all_dims) - 1):
+            din_layer = all_dims[i]
+            dout_layer = all_dims[i + 1]
+            
+            # Main linear layer
+            linear_layer = nnx.Linear(din_layer, dout_layer, use_bias=True, rngs=rngs)
+            self.layers.append(linear_layer)
+            
+            # Projection layer for residual connection if dimensions don't match
+            if self.use_residual and din_layer != dout_layer:
+                proj_layer = nnx.Linear(din_layer, dout_layer, 
+                                        use_bias=False, 
+                                        kernel_init=nnx.initializers.orthogonal(),
+                                        rngs=rngs)
+                self.projections.append(proj_layer)
+            else:
+                self.projections.append(None)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        return self.net(x)
+        
+        h = x
+        for i, (layer, projection) in enumerate(zip(self.layers, self.projections)):
+            h_input = h
+            h = layer(h)
+            
+            if i < len(self.layers) - 1:
+                h = self.act(h)
+
+            if self.use_residual and i < len(self.layers) - 1:
+                if projection is not None:
+                    h = h + projection(h_input)
+                else:
+                    h = h + h_input
+        
+        return h
     
     
 class Identity(nnx.Module):
@@ -138,12 +182,15 @@ class NNROM(BaseROM, nnx.Module):
         self.rngs = rngs
 
         self.nn_encoder = Identity() if self.cfg.encoder_specs is None else\
-                          MLP(nx, nz, self.cfg.encoder_specs, act=self.cfg.act, rngs=self.rngs)
+                          MLP(nx, nz, self.cfg.encoder_specs, act=self.cfg.act_encoder, 
+                              use_residual=self.cfg.use_residual_encoder, rngs=self.rngs)
 
         self.nn_decoder = Identity() if self.cfg.decoder_specs is None else\
-                          MLP(nz, nx, self.cfg.decoder_specs, act=self.cfg.act, rngs=self.rngs)
-
-        self.nn_fz = MLP(nz+nu, nz, self.cfg.fz_specs, act=self.cfg.act, rngs=self.rngs)
+                          MLP(nz, nx, self.cfg.decoder_specs, act=self.cfg.act_decoder,
+                              use_residual=self.cfg.use_residual_decoder, rngs=self.rngs)
+            
+        self.nn_fz = MLP(nz+nu, nz, self.cfg.fz_specs, act=self.cfg.act_fz,
+                         use_residual=self.cfg.use_residual_fz, rngs=self.rngs)
 
         
     def encode(self, x: jnp.ndarray) -> jnp.ndarray:  # natively batched, but vmap also supported
@@ -190,7 +237,7 @@ def make_loss_plots(inte_out: Dict,
 @flax_dataclass
 class CfgLoss:
     recon: float = 1.0
-    reproj: float = 1.0
+    reproj: float = 0.0
     fwd: float = 1.0
     bwd: float = 1.0
 
@@ -202,13 +249,14 @@ class CfgTrain:
     batch_size_eval: int = 256
     num_epochs: int = 10
     num_logs: int = 10
+    ae_warmup_portion: float = 0.2   # percentage of total training steps (out of batch * epochs) for ae warmup
     max_train_pred_horizon: int = 4
     max_eval_pred_horizon: int = 4
-    enable_lr_schedule: bool = False
-    enable_grad_clipping: bool = True
+    enable_lr_schedule: bool = True
+    enable_grad_clipping: bool = False
     grad_clipping_value: float = 5.0
     train_portion: float = 0.9
-    # wandb config
+    # wandb config # TODO: Implement wandb support
     use_wandb: bool = False
     wandb_project: str = "latent_loco"
     wandb_run_name: str|None = None
@@ -225,35 +273,51 @@ def train(rom: nnx.Module, dataset: Dataset,
                                 num_workers=8, pin_memory=True, persistent_workers=True)
     
     total_steps = cfg_train.num_epochs * len(dataloader)
+    ae_warmup_steps = int(cfg_train.ae_warmup_portion * total_steps)
+    rl_decay_steps = total_steps - ae_warmup_steps
     if cfg_train.enable_lr_schedule:
         lr_schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.1 * cfg_train.lr, 
             peak_value=cfg_train.lr,
-            warmup_steps=int(0.1 * total_steps), 
-            decay_steps=total_steps,
+            warmup_steps=int(0.1 * rl_decay_steps), 
+            decay_steps=rl_decay_steps,
         )
+        # pred_horizon_schedule = optax.linear_schedule(init_value)
     else:
         lr_schedule = cfg_train.lr
     
     def make_tx() -> optax.GradientTransformation:
-        transforms = [optax.adam(lr_schedule)]
+        transforms = [optax.adamw(lr_schedule)]
         if cfg_train.enable_grad_clipping:
             transforms.append(
-                optax.adaptive_grad_clip(clipping=cfg_train.grad_clipping_value,eps=1e-3)
+                optax.adaptive_grad_clip(clipping=cfg_train.grad_clipping_value, eps=1e-3)
             )
         return optax.chain(*transforms)
     
     tx = make_tx()
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     
-    @nnx.jit
-    def step(model: nnx.Module, opt: nnx.Optimizer, batch: dict):
+    @nnx.jit(static_argnums=(3,))
+    def step(model: nnx.Module, opt: nnx.Optimizer, batch: dict, in_ae_warmup: bool):
         
         def loss_fn(m: BaseROM):
             recon = m.loss_recon(batch)
-            reproj = m.loss_reproj(batch)
-            fwd   = m.loss_fwd(batch, cfg_train.max_train_pred_horizon)
-            bwd   = m.loss_bwd(batch, cfg_train.max_train_pred_horizon)
+            
+            if cfg_loss.reproj > 0:
+                reproj = m.loss_reproj(batch)
+            else:
+                reproj = jnp.asarray(0.0)
+            
+            if cfg_loss.fwd > 0 and not in_ae_warmup:
+                fwd = m.loss_fwd(batch, cfg_train.max_train_pred_horizon)
+            else:
+                fwd = jnp.asarray(0.0)
+            
+            if cfg_loss.bwd > 0 and not in_ae_warmup:
+                bwd   = m.loss_bwd(batch, cfg_train.max_train_pred_horizon)
+            else:
+                bwd = jnp.asarray(0.0)
+            
             total = (cfg_loss.recon * recon
                      + cfg_loss.reproj * reproj
                      + cfg_loss.fwd * fwd
@@ -274,12 +338,16 @@ def train(rom: nnx.Module, dataset: Dataset,
         batch_losses = []
         for i, batch in enumerate(dataloader):
             batch = dataset.collate_fn(batch)
-            rom, opt, loss, aux = step(rom, opt, batch)
+            
+            in_ae_warmup = global_step < ae_warmup_steps
+            rom, opt, loss, aux = step(rom, opt, batch, False)
 
             batch_losses.append(loss)
             global_step += 1
             
-            pbar.set_postfix({"b_loss": f"{float(loss):.2e}", "b_progress": f"{i}/{len(dataloader)}"})
+            pbar.set_postfix({"b_loss": f"{float(loss):.2e}", 
+                              "b_progress": f"{i}/{len(dataloader)}",
+                              "b_in_ae_warmup": in_ae_warmup})
         
         # log epoch-level metrics
     
@@ -318,6 +386,7 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     batch = next(iter(dataloader))
     batch = dataset.collate_fn(batch)
     x, xs_next, us = batch['from'], batch['to'], batch['ctrl']  # (b,nx), (b,pred_horizon,nx), (b,pred_horizon,nu)
+    print(f"x.shape: {x.shape}, xs_next.shape: {xs_next.shape}, us.shape: {us.shape}")
     
     B, _pred_horizon, nu = us.shape
     pred_horizon = cfg_train.max_eval_pred_horizon
@@ -339,12 +408,14 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     _, zs_next_pred, xs_next_pred = jax.lax.fori_loop(0, pred_horizon, step, (z, zs_next_pred, xs_next_pred))   
     zs_next = rom.encode(xs_next)
 
-    fig1, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig1, axes = plt.subplots(1, 4, figsize=(15, 5))
     axes[0].set_title(r"Initial States $x_0$")
     axes[1].set_title(r"Reconstructed States $D(E(x_0))$")
-    axes[2].set_title(r"Reprojected States $E(D(E(x_0)))$")
-    for (ax, data) in zip(axes, [x, x_recon, z_reproj]):
-        ax.scatter(data[:,0], data[:,1])
+    axes[2].set_title(r"Encoded States $E(x_0)$")
+    axes[3].set_title(r"Re-Encoded States $E(D(E(x_0)))$")
+    for (ax, data) in zip(axes, [x, x_recon, z, z_reproj]):
+        for i in range(data.shape[0]):
+            ax.scatter(data[i,0], data[i,1])
     plt.show()
     
     fig2, axes = plt.subplots(1, 4, figsize=(20, 5))
