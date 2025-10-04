@@ -275,6 +275,10 @@ def train(rom: nnx.Module, dataset: Dataset,
     total_steps = cfg_train.num_epochs * len(dataloader)
     ae_warmup_steps = int(cfg_train.ae_warmup_portion * total_steps)
     rl_decay_steps = total_steps - ae_warmup_steps
+    
+    pred_horizon_schedule = optax.linear_schedule(init_value=1,
+                                                  end_value=cfg_train.max_train_pred_horizon,
+                                                  transition_steps=rl_decay_steps)
     if cfg_train.enable_lr_schedule:
         lr_schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.1 * cfg_train.lr, 
@@ -282,7 +286,6 @@ def train(rom: nnx.Module, dataset: Dataset,
             warmup_steps=int(0.1 * rl_decay_steps), 
             decay_steps=rl_decay_steps,
         )
-        # pred_horizon_schedule = optax.linear_schedule(init_value)
     else:
         lr_schedule = cfg_train.lr
     
@@ -297,10 +300,12 @@ def train(rom: nnx.Module, dataset: Dataset,
     tx = make_tx()
     opt = nnx.Optimizer(rom, tx, wrt=nnx.Param)
     
-    @nnx.jit(static_argnums=(3,))
-    def step(model: nnx.Module, opt: nnx.Optimizer, batch: dict, in_ae_warmup: bool):
+    @nnx.jit(static_argnums=(3,4))
+    def step(model: nnx.Module, opt: nnx.Optimizer, batch: dict, 
+             in_ae_warmup: bool, pred_horizon: int):
         
         def loss_fn(m: BaseROM):
+            
             recon = m.loss_recon(batch)
             
             if cfg_loss.reproj > 0:
@@ -309,12 +314,12 @@ def train(rom: nnx.Module, dataset: Dataset,
                 reproj = jnp.asarray(0.0)
             
             if cfg_loss.fwd > 0 and not in_ae_warmup:
-                fwd = m.loss_fwd(batch, cfg_train.max_train_pred_horizon)
+                fwd = m.loss_fwd(batch, pred_horizon)
             else:
                 fwd = jnp.asarray(0.0)
             
             if cfg_loss.bwd > 0 and not in_ae_warmup:
-                bwd   = m.loss_bwd(batch, cfg_train.max_train_pred_horizon)
+                bwd = m.loss_bwd(batch, pred_horizon)
             else:
                 bwd = jnp.asarray(0.0)
             
@@ -322,7 +327,10 @@ def train(rom: nnx.Module, dataset: Dataset,
                      + cfg_loss.reproj * reproj
                      + cfg_loss.fwd * fwd
                      + cfg_loss.bwd * bwd)
-            aux = {'recon': recon, 'reproj': reproj, 'fwd': fwd, 'bwd': bwd, 'total': total}
+            
+            aux = {'total': total, 'recon': recon, 'reproj': reproj, 
+                   'fwd': fwd, 'bwd': bwd,
+                   'pred_horizon': pred_horizon}
             return total, aux
 
         (loss_val, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
@@ -338,16 +346,21 @@ def train(rom: nnx.Module, dataset: Dataset,
         batch_losses = []
         for i, batch in enumerate(dataloader):
             batch = dataset.collate_fn(batch)
+            pred_horizon = int(pred_horizon_schedule(global_step - ae_warmup_steps) if global_step >= ae_warmup_steps else 1)
             
             in_ae_warmup = global_step < ae_warmup_steps
-            rom, opt, loss, aux = step(rom, opt, batch, False)
+            rom, opt, loss, aux = step(rom, opt, batch, in_ae_warmup, pred_horizon)
+            
 
             batch_losses.append(loss)
             global_step += 1
             
-            pbar.set_postfix({"b_loss": f"{float(loss):.2e}", 
-                              "b_progress": f"{i}/{len(dataloader)}",
-                              "b_in_ae_warmup": in_ae_warmup})
+            pbar.set_postfix({
+                "pred_horizon": f"{float(pred_horizon):.0f}",
+                "b_loss": f"{float(loss):.2e}", 
+                "b_prog": f"{i}/{len(dataloader)}",
+                "in_ae_warmup": in_ae_warmup,
+            })
         
         # log epoch-level metrics
     
@@ -424,7 +437,16 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     axes[2].set_title(r"Rollout $x_{t:t+\tau+1}$, $\tau=$" + str(pred_horizon))
     axes[3].set_title(r"Rollout Pred $x_t + D(f_z^{(\tau)}\circ E(x_t))$")
     
+    
+    # axes[1].set_xlim(axes[0].get_xlim())
+    # axes[1].set_ylim(axes[0].get_ylim())
+    # axes[3].set_xlim(axes[2].get_xlim())
+    # axes[3].set_ylim(axes[2].get_ylim())
+    
+    
     for (ax, data) in zip(axes, [zs_next, zs_next_pred, xs_next, xs_next_pred]):
+        ax.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        ax.axvline(x=0, color='k', linestyle='-', alpha=0.3)
         for i in range(data.shape[0]):
             ax.plot(data[i,:,0], data[i,:,1])
             ax.plot(data[i,0,0], data[i,0,1], 'r.')
