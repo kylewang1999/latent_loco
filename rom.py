@@ -9,8 +9,10 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 import jax_dataloader as jdl
 import wandb
+from einops import rearrange
 
 from utils import catch_keyboard_interrupt, save_nnx_module
+from data_gen import BaseDataset, IntegratorOutput
 
 
 @flax_dataclass
@@ -47,6 +49,22 @@ class CfgNNCartPoleROM(CfgROMBase):
     act_decoder: Callable = nnx.tanh
     use_residual_encoder: bool = True
     use_residual_decoder: bool = True
+    use_residual_fz: bool = True
+    
+@flax_dataclass
+class CfgNNPaddleballROM(CfgROMBase):
+    nx: int = 4
+    nz: int = 4
+    nu: int = 1
+    nc: int = 1
+    encoder_specs: Tuple[int, ...]|None = None
+    decoder_specs: Tuple[int, ...]|None = None
+    fz_specs: Tuple[int, ...] = (128,128,128)
+    act_fz: Callable = nnx.tanh
+    act_encoder: Callable = nnx.tanh
+    act_decoder: Callable = nnx.tanh
+    use_residual_encoder: bool =True
+    use_residual_decoder: bool =True
     use_residual_fz: bool = True
 
 
@@ -262,6 +280,9 @@ class CfgTrain:
     wandb_run_name: str|None = None
     wandb_log_frequency: int = 1  # log every N batches
     
+    num_eval_long_rollout_traj: int = 100
+    eval_rng_seed: int = 0
+    
 
 
 @catch_keyboard_interrupt("Training interrupted by user")
@@ -270,7 +291,7 @@ def train(rom: nnx.Module, dataset: Dataset,
 
     dataloader = jdl.DataLoader(dataset, batch_size=cfg_train.batch_size, 
                                 backend='pytorch', shuffle=True, 
-                                num_workers=8, pin_memory=True, persistent_workers=True)
+                                num_workers=16, pin_memory=True, persistent_workers=True)
     
     total_steps = cfg_train.num_epochs * len(dataloader)
     ae_warmup_steps = int(cfg_train.ae_warmup_portion * total_steps)
@@ -306,6 +327,23 @@ def train(rom: nnx.Module, dataset: Dataset,
         
         def loss_fn(m: BaseROM):
             
+            loss_dict = {
+                'total': jnp.asarray(0.0),
+                'recon': jnp.asarray(0.0),
+                'reproj': jnp.asarray(0.0),
+                'fwd': jnp.asarray(0.0),
+                'bwd': jnp.asarray(0.0),
+            }
+            
+            for key in ['recon', 'reproj', 'fwd', 'bwd']:
+                _l = getattr(m, f'loss_{key}')(batch)
+                _l = jnp.nan_to_num(_l, nan=0.0) # replace nan with 0
+                loss_dict[key] = _l
+            
+            total = jnp.sum(jnp.stack(list(loss_dict.values())))
+            return total, loss_dict
+        
+        def loss_fn_old(m: BaseROM):
             recon = m.loss_recon(batch)
             
             if cfg_loss.reproj > 0:
@@ -322,6 +360,7 @@ def train(rom: nnx.Module, dataset: Dataset,
                 bwd = m.loss_bwd(batch, pred_horizon)
             else:
                 bwd = jnp.asarray(0.0)
+            
             
             total = (cfg_loss.recon * recon
                      + cfg_loss.reproj * reproj
@@ -392,6 +431,16 @@ def train(rom: nnx.Module, dataset: Dataset,
 
 
 def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: CfgLoss):
+    '''
+    Parameters
+    ----------
+    rom: nnx.Module
+        The ROM model to evaluate.
+    dataset: Dataset
+        The dataset to evaluate on. This is a subset object, not the BaseDataset object.
+    cfg_train: CfgTrain
+    cfg_loss: CfgLoss
+    '''
     
     dataloader = jdl.DataLoader(dataset, batch_size=cfg_train.batch_size_eval, 
                                 backend='pytorch', shuffle=False)
@@ -454,6 +503,102 @@ def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: C
     plt.show()
     
     
+def evaluate_long_rollout(rom: nnx.Module, dataset: BaseDataset, cfg_train: CfgTrain, cfg_loss: CfgLoss):
+    '''
+    Parameters
+    ----------
+    rom: nnx.Module
+        The ROM model to evaluate.
+    dataset: BaseDataset
+        The dataset to evaluate on,
+    cfg_train: CfgTrain
+    cfg_loss: CfgLoss
+    '''
+    
+    data:IntegratorOutput = dataset.data
+    N, T = data.num_traj, data.num_tsteps-1
+    B = cfg_train.num_eval_long_rollout_traj
+    pick_inds = jax.random.choice(jax.random.PRNGKey(cfg_train.eval_rng_seed), N, (B,))
+    
+    xs = jnp.asarray(data.xs[pick_inds])
+    zs = rom.encode(xs)
+    us = jnp.asarray(data.us[pick_inds])
+    cs = None if data.cs is None else jnp.asarray(data.cs[pick_inds])
+
+    z = zs[:,0,:]
+    x_recon = rom.decode(z)
+    z_reproj = rom.encode(x_recon)
+    zs_next_pred = jnp.zeros((B, T+1, rom.cfg.nz))
+    xs_next_pred = jnp.zeros((B, T+1, rom.cfg.nx))
+    
+    def step(t, carry):
+        z, zs_next_pred, xs_next_pred = carry
+        z = rom.fz(z, us[:,t])
+        x_dec = rom.decode(z)
+        zs_next_pred = zs_next_pred.at[:,t].set(z)
+        xs_next_pred = xs_next_pred.at[:,t].set(x_dec)
+        return z, zs_next_pred, xs_next_pred
+    
+    _, zs_next_pred, xs_next_pred = jax.lax.fori_loop(0, T, step, (z, zs_next_pred, xs_next_pred))
+    
+    state_annotations = ["q0", "q1", "v0", "v1"]
+    ts = jnp.arange(T+1)
+    fig, axes = plt.subplots(4, 2, figsize=(10,15))
+    for i in range(len(axes)):
+        axes[i][0].set_title(f"{state_annotations[i]}, ground truth")
+        axes[i][1].set_title(f"{state_annotations[i]}, predicted")
+        for j in range(B):
+            axes[i][0].plot(ts, xs[j,:,i])
+            axes[i][1].plot(ts, xs_next_pred[j,:,i])
+    plt.show()
+    
+    fig, axes = plt.subplots(2, 2, figsize=(10,10))
+    state_annotations = ['q0 vs v0', 'q1 vs v1']
+    for i in range(len(axes)):
+        axes[i][0].set_title(f"{state_annotations[i]}, ground truth")
+        axes[i][1].set_title(f"{state_annotations[i]}, predicted")
+    
+    for j in range(B):
+        axes[0][0].plot(xs[j,:,0], xs[j,:,2], )
+        axes[0][1].plot(xs_next_pred[j,:,0], xs_next_pred[j,:,2])
+        axes[1][0].plot(xs[j,:,1], xs[j,:,3])
+        axes[1][1].plot(xs_next_pred[j,:,1], xs_next_pred[j,:,3])
+    plt.show()
+    
+    
+    # dzs = zs_next_pred[:,:-1,:] - zs_next_pred[:,1:,:]
+    # print(dzs.shape)
+    
+    grid_q0 = jnp.linspace(0, 4, n0:=20)
+    grid_v0 = jnp.linspace(-8, 5, n2:=20)
+    grid_q1 = jnp.linspace(-0.5, 1, n1:=20)
+    grid_v1 = jnp.linspace(-5,5, n3:=20)
+    q0s, v0s = jnp.meshgrid(grid_q0, grid_v0)
+    q1s, v1s = jnp.meshgrid(grid_q1, grid_v1)
+    xs_query_02 = jnp.stack([q0s, jnp.zeros_like(q0s), v0s, jnp.zeros_like(v0s)], axis=-1)
+    xs_query_13 = jnp.stack([jnp.zeros_like(q1s), q1s, jnp.zeros_like(v1s), v1s], axis=-1)
+    zs_query_02 = rom.encode(xs_query_02)
+    zs_query_13 = rom.encode(xs_query_13)
+    
+    dzs_query_02 = rom.fz(rearrange(zs_query_02, "nx ny nz -> (nx ny) nz"), jnp.zeros((n0*n2, 1)))
+    dzs_query_02 = rearrange(dzs_query_02, "(nx ny) nz -> nx ny nz", nx=n0, ny=n2)
+    dzs_query_02 -= zs_query_02
+    
+    dzs_query_13 = rom.fz(rearrange(zs_query_13, "nx ny nz -> (nx ny) nz"), jnp.ones((n0*n2, 1)))
+    dzs_query_13 = rearrange(dzs_query_13, "(nx ny) nz -> nx ny nz", nx=n0, ny=n2)
+    dzs_query_13 -= zs_query_13
+
+    fig, axes = plt.subplots(2, 2, figsize=(10,10))
+    axes[0][0].set_title("q0, v0; ground truth")
+    axes[0][1].set_title("q0, v0; predicted")
+    axes[1][0].set_title("q1, v1; ground truth")
+    axes[1][1].set_title("q1, v1; predicted")
+    
+    axes[0][1].quiver(q0s, v0s, dzs_query_02[:,:,0], dzs_query_02[:,:,2])
+    axes[1][1].quiver(q1s, v1s, dzs_query_13[:,:,1], dzs_query_13[:,:,3])
+    plt.show()
+    
+
 
 def post_train(rom: nnx.Module, dataset: Dataset, 
                cfg_train: CfgTrain, cfg_loss: CfgLoss, save_dir: str):

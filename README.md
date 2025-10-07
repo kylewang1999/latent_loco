@@ -5,7 +5,7 @@
 The following setup procedure is meant for Linux system with NVIDIA CUDA GPU.
 
 ```bash
-conda deactivate && conda remove -n latent_loco --all -y &&conda create -n latent_loco python=3.10 -y && conda activate latent_loco && bash bootstrap.sh
+conda deactivate && conda remove -n latent_loco --all -y && conda create -n latent_loco python=3.10 -y && conda activate latent_loco && bash bootstrap.sh
 python -c "from jax.lib import xla_bridge; print(xla_bridge.get_backend().platform)"
 python -c "import torch; print(torch.cuda.is_available())"
 ```

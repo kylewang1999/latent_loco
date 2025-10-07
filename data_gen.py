@@ -1,9 +1,11 @@
 import os, os.path as osp
 import jax, jax.numpy as jnp, numpy as np
 import matplotlib.pyplot as plt
+from jax.scipy.signal import convolve
 from jax import vmap, jit, grad
 from jax.tree_util import tree_map
 from flax.struct import dataclass as flax_dataclass
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -36,9 +38,16 @@ def rk4_batch(f, xs, us, dt):
 class IntegratorOutput:
     xs: jnp.ndarray
     us: jnp.ndarray
+    cs: jnp.ndarray | None = None  # contact forces, if hybrid dynamics
     
     @property
     def attrs(self): return ("xs", "us")
+    
+    @property
+    def num_traj(self): return self.xs.shape[0]
+    
+    @property
+    def num_tsteps(self): return self.xs.shape[1]
 
     
 @dataclass
@@ -181,8 +190,6 @@ class DoubinteDataset(BaseDataset):
         super()._log()
         
 
-
-
 class CartPoleDataset(BaseDataset):
     
     def __init__(self, pred_horizon: int, data_path:str=osp.join(get_repo_root(), "data/cart_pole_data.npz")):
@@ -203,6 +210,84 @@ class CartPoleDataset(BaseDataset):
                                          for t in range(self.max_tstep - self.pred_horizon - 1)]
         
         super()._log()
+
+
+class PaddleballDataset(BaseDataset):
+    
+    def __init__(self, 
+                 pred_horizon: int, 
+                 data_path:str=osp.join(get_repo_root(), "data/paddleball_data.npz"),
+                 eps_flight: float = 1.0,
+                 kernel_width: int = 5,
+                 mode: str = "continuous"):
+        
+        super().__init__(pred_horizon, data_path)
+        
+        self.pred_horizon = pred_horizon
+        self.data_path = data_path
+        self.kernel_width = kernel_width
+        
+        data_np = np.load(data_path)
+        
+        self.data:IntegratorOutput = IntegratorOutput(xs=jnp.concatenate([data_np['q_log'], data_np['v_log']], axis=-1), 
+                                                      us=jnp.array(data_np['u_log']),
+                                                      cs=jnp.array(data_np['c_log']))
+        
+        self.max_tstep = self.data.us.shape[1]
+        N, T, _ = self.data.us.shape
+        H = self.pred_horizon
+        
+        ''' Smoothing and binarization to get contact mask'''
+        kernel = jnp.ones(kernel_width)/kernel_width    
+        fn_smooth_and_binarize = lambda x: convolve(x.flatten(), kernel, mode='same') > 0
+        self.mask_contact = vmap(fn_smooth_and_binarize, in_axes=(0,))(self.data.cs)
+        self.mask_flight = np.abs(self.data.cs.squeeze(-1)) <= eps_flight   # (N, T) boolean
+        print(self.mask_flight.shape)
+        print(self.mask_contact.shape)
+        
+        self.window_start_inds = []
+        self.window_end_inds = []  # only used for contact mode
+        
+        if mode in ["all", "continuous"]:
+            
+            for i in range(N):
+                for t in range(T-H-1):
+                    if mode == "all":
+                        self.window_start_inds.append((i, t))
+                    elif mode == "continuous" and self.mask_flight[i, t:t+H].all():
+                        self.window_start_inds.append((i, t))
+      
+        elif mode == "contact":
+            
+            mc = self.mask_contact
+            N, T = mc.shape
+            pad = jnp.pad(mc, ((0,0), (1,1))).astype(jnp.int32)
+            diff = pad[:, 1:] - pad[:,:-1]
+            i_start, t_start = jnp.where(diff == 1)    # indices of starts (N_idx, T_idx)
+            i_end_p1, t_end_p1 = jnp.where(diff == -1) # indices of ends+1 (N_idx, T_idx)
+            t_end = t_end_p1 - 1
+            
+            starts = jnp.stack([i_start, t_start], axis=-1)
+            ends = jnp.stack([i_end_p1, t_end], axis=-1)
+            
+            self.window_start_inds = list(map(tuple, starts.tolist()))
+            self.window_end_inds = list(map(tuple, ends.tolist()))
+            assert len(self.window_start_inds) == len(self.window_end_inds), "window_start_inds and window_end_inds must have the same length"
+            
+            self.traj_inverval_dict = {}
+            for ((i, start), (_, end)) in zip(self.window_start_inds, self.window_end_inds):
+                if i in self.traj_inverval_dict.keys():
+                    self.traj_inverval_dict[i].append((start, end))
+                else:
+                    self.traj_inverval_dict[i] = [(start, end)]
+                    
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Choose from: all, continuous, contact")
+    
+
+        super()._log()
+        
+        
 
 
 
