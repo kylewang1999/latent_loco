@@ -212,6 +212,7 @@ def save_nnx_module(model: nnx.Module, save_dir: str):
 
 def restore_nnx_module(build_fn: Callable[[], nnx.Module],
                        ckpt_dir: str | Path,
+                       verbose: bool = False,
                        *,
                        name: str = "state") -> nnx.Module:
     
@@ -220,7 +221,8 @@ def restore_nnx_module(build_fn: Callable[[], nnx.Module],
 
     abstract_model = nnx.eval_shape(build_fn)
     graphdef, state_norng, state_rng = nnx.split(abstract_model, nnx.Not(nnx.RngState), nnx.RngState)
-    nnx.display(state_norng)
+    if verbose:
+        nnx.display(state_norng)
 
     state_restored = checkpointer.restore(path, state_norng, strict=False)
     model = nnx.merge(graphdef, state_restored, state_rng)

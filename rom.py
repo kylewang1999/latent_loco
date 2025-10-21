@@ -59,10 +59,10 @@ class CfgNNPaddleballROM(CfgROMBase):
     nc: int = 1
     encoder_specs: Tuple[int, ...]|None = None
     decoder_specs: Tuple[int, ...]|None = None
-    fz_specs: Tuple[int, ...] = (128,128,128)
+    fz_specs: Tuple[int, ...] = tuple(256 for _ in range(6))
     act_fz: Callable = nnx.tanh
-    act_encoder: Callable = nnx.tanh
-    act_decoder: Callable = nnx.tanh
+    act_encoder: Callable = nnx.gelu
+    act_decoder: Callable = nnx.gelu
     use_residual_encoder: bool =True
     use_residual_decoder: bool =True
     use_residual_fz: bool = True
@@ -135,13 +135,13 @@ class BaseROM():
     def decode(self, z: jnp.ndarray) -> jnp.ndarray: raise NotImplementedError
     def fz(self, z: jnp.ndarray) -> jnp.ndarray: raise NotImplementedError
     
-    def loss_recon(self, batch:dict) -> jnp.ndarray:
+    def loss_recon(self, batch:dict, *args, **kwargs) -> jnp.ndarray:
         x = batch['from'] # (b, nx)
         x_recon = self.decode(self.encode(x))
         diff = jnp.linalg.norm(x_recon - x, axis=-1)
         return jnp.mean(diff)
     
-    def loss_reproj(self, batch:dict) -> jnp.ndarray:
+    def loss_reproj(self, batch:dict, *args, **kwargs) -> jnp.ndarray:
         x = batch['from'] # (b, nx)
         z = self.encode(x) # (b, nz)
         x_recon = self.decode(z)
@@ -286,12 +286,10 @@ class CfgTrain:
 
 
 @catch_keyboard_interrupt("Training interrupted by user")
-def train(rom: nnx.Module, dataset: Dataset,
-          cfg_train: CfgTrain, cfg_loss: CfgLoss):
+def train(rom: nnx.Module, dataloader: jdl.DataLoader,
+          cfg_train: CfgTrain, cfg_loss: CfgLoss, collate_fn: Callable=lambda x: x):
 
-    dataloader = jdl.DataLoader(dataset, batch_size=cfg_train.batch_size, 
-                                backend='pytorch', shuffle=True, 
-                                num_workers=16, pin_memory=True, persistent_workers=True)
+
     
     total_steps = cfg_train.num_epochs * len(dataloader)
     ae_warmup_steps = int(cfg_train.ae_warmup_portion * total_steps)
@@ -384,7 +382,7 @@ def train(rom: nnx.Module, dataset: Dataset,
         
         batch_losses = []
         for i, batch in enumerate(dataloader):
-            batch = dataset.collate_fn(batch)
+            batch = collate_fn(batch)
             pred_horizon = int(pred_horizon_schedule(global_step - ae_warmup_steps) if global_step >= ae_warmup_steps else 1)
             
             in_ae_warmup = global_step < ae_warmup_steps
@@ -429,6 +427,38 @@ def train(rom: nnx.Module, dataset: Dataset,
     
     return rom
 
+
+def evaluate_cts(rom: NNROM):
+    
+
+    q0s, v0s = jnp.meshgrid(jnp.linspace(0, 4, n0:=20), 
+                            jnp.linspace(-8, 5, n2:=20))
+    q1s, v1s = jnp.meshgrid(jnp.linspace(-0.5, 1, n1:=20), 
+                            jnp.linspace(-5,5, n3:=20))
+    xs_query_02 = jnp.stack([q0s, jnp.zeros_like(q0s), v0s, jnp.zeros_like(v0s)], axis=-1)
+    xs_query_13 = jnp.stack([jnp.zeros_like(q1s), q1s, jnp.zeros_like(v1s), v1s], axis=-1)
+    zs_query_02 = rom.encode(xs_query_02)
+    zs_query_13 = rom.encode(xs_query_13)
+    
+    dzs_query_02 = rom.fz(rearrange(zs_query_02, "nx ny nz -> (nx ny) nz"), jnp.zeros((n0*n2, 1)))
+    dzs_query_02 = rearrange(dzs_query_02, "(nx ny) nz -> nx ny nz", nx=n0, ny=n2)
+    dzs_query_02 -= zs_query_02
+    
+    dzs_query_13 = rom.fz(rearrange(zs_query_13, "nx ny nz -> (nx ny) nz"), jnp.ones((n1*n3, 1)))
+    dzs_query_13 = rearrange(dzs_query_13, "(nx ny) nz -> nx ny nz", nx=n0, ny=n2)
+    dzs_query_13 -= zs_query_13
+
+    fig, axes = plt.subplots(2, 2, figsize=(10,10))
+    axes[0][0].set_title("q0, v0; ground truth")
+    axes[0][1].set_title("q0, v0; predicted")
+    axes[1][0].set_title("q1, v1; ground truth")
+    axes[1][1].set_title("q1, v1; predicted")
+    
+    axes[0][1].quiver(q0s, v0s, dzs_query_02[:,:,0], dzs_query_02[:,:,2])
+    axes[1][1].quiver(q1s, v1s, dzs_query_13[:,:,1], dzs_query_13[:,:,3])
+    plt.show()
+
+    
 
 def evaluate(rom: nnx.Module, dataset: Dataset, cfg_train: CfgTrain, cfg_loss: CfgLoss):
     '''

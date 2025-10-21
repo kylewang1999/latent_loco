@@ -1,7 +1,8 @@
 import os, os.path as osp
 import jax, jax.numpy as jnp, numpy as np
 import matplotlib.pyplot as plt
-from jax.scipy.signal import convolve
+from jax.scipy.signal import convolve as convolve_jax
+from scipy.signal import convolve as convolve_np
 from jax import vmap, jit, grad
 from jax.tree_util import tree_map
 from flax.struct import dataclass as flax_dataclass
@@ -168,8 +169,24 @@ class BaseDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
+        '''
+        Input:
+            batch: list of dicts, each with keys: 'from', 'ctrl', 'to'
+        Output:
+            dict with keys: 'from', 'ctrl', 'to', each with shape (B, ...)
+        '''
+        
         batch = tree_map(jnp.asarray, batch)
-        return batch
+        
+        if isinstance(batch, dict):
+            return batch
+        
+        else:
+            ret_dict = {}
+            for key in batch[0].keys():
+                ret_dict[key] = jnp.stack([b[key] for b in batch])
+            
+            return ret_dict
 
 
 class DoubinteDataset(BaseDataset):
@@ -229,22 +246,21 @@ class PaddleballDataset(BaseDataset):
         
         data_np = np.load(data_path)
         
-        self.data:IntegratorOutput = IntegratorOutput(xs=jnp.concatenate([data_np['q_log'], data_np['v_log']], axis=-1), 
-                                                      us=jnp.array(data_np['u_log']),
-                                                      cs=jnp.array(data_np['c_log']))
+        self.data:IntegratorOutput = IntegratorOutput(xs=np.concatenate([data_np['q_log'], data_np['v_log']], axis=-1), 
+                                                      us=np.array(data_np['u_log']),
+                                                      cs=np.array(data_np['c_log']))
         
         self.max_tstep = self.data.us.shape[1]
         N, T, _ = self.data.us.shape
         H = self.pred_horizon
         
         ''' Smoothing and binarization to get contact mask'''
-        kernel = jnp.ones(kernel_width)/kernel_width    
-        fn_smooth_and_binarize = lambda x: convolve(x.flatten(), kernel, mode='same') > 0
-        self.mask_contact = vmap(fn_smooth_and_binarize, in_axes=(0,))(self.data.cs)
-        self.mask_flight = np.abs(self.data.cs.squeeze(-1)) <= eps_flight   # (N, T) boolean
-        print(self.mask_flight.shape)
-        print(self.mask_contact.shape)
+        kernel = np.ones(kernel_width)/kernel_width    
+        fn_smooth_and_binarize = lambda x: convolve_np(x.flatten(), kernel, mode='same') > 0
+        self.mask_contact = np.array([fn_smooth_and_binarize(x) for x in self.data.cs])
         
+        # self.mask_contact = vmap(fn_smooth_and_binarize, in_axes=(0,))(self.data.cs)
+        self.mask_flight = np.abs(self.data.cs.squeeze(-1)) <= eps_flight   # (N, T) boolean
         self.window_start_inds = []
         self.window_end_inds = []  # only used for contact mode
         
@@ -261,15 +277,17 @@ class PaddleballDataset(BaseDataset):
             
             mc = self.mask_contact
             N, T = mc.shape
-            pad = jnp.pad(mc, ((0,0), (1,1))).astype(jnp.int32)
+            pad = np.pad(mc, ((0,0), (1,1))).astype(np.int32)
             diff = pad[:, 1:] - pad[:,:-1]
-            i_start, t_start = jnp.where(diff == 1)    # indices of starts (N_idx, T_idx)
-            i_end_p1, t_end_p1 = jnp.where(diff == -1) # indices of ends+1 (N_idx, T_idx)
+            i_start, t_start = np.where(diff == 1)    # indices of starts (N_idx, T_idx)
+            i_end_p1, t_end_p1 = np.where(diff == -1) # indices of ends+1 (N_idx, T_idx)
             t_end = t_end_p1 - 1
             
-            starts = jnp.stack([i_start, t_start], axis=-1)
-            ends = jnp.stack([i_end_p1, t_end], axis=-1)
+            starts = np.stack([i_start, t_start], axis=-1)
+            ends = np.stack([i_end_p1, t_end], axis=-1)
             
+            self.starts = starts
+            self.ends = ends
             self.window_start_inds = list(map(tuple, starts.tolist()))
             self.window_end_inds = list(map(tuple, ends.tolist()))
             assert len(self.window_start_inds) == len(self.window_end_inds), "window_start_inds and window_end_inds must have the same length"
